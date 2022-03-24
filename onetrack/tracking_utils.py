@@ -68,13 +68,13 @@ def match_reco_tracks(
     truth, particles, particle_lengths = get_particle_lengths(truth, particles, min_hits_truth)
 
     # 4. Get common and shared hits between candidates and particles
-    reconstructed, reco_matching, truth_matching = get_shared_hits(truth, reconstructed, candidate_lengths, particle_lengths)
+    reconstructed, spacepoint_matching = get_shared_hits(truth, reconstructed, candidate_lengths, particle_lengths)
 
     # 5. Calculate matching fractions
-    reco_matching, truth_matching = get_matching_fractions(reco_matching, truth_matching)
+    spacepoint_matching = get_matching_fractions(spacepoint_matching)
     
     # 6. Apply matching criteria
-    particles, reconstructed = apply_matching_criteria(particles, reconstructed, reco_matching, truth_matching, frac_reco_matched, frac_truth_matched, **kwargs)
+    particles, reconstructed = apply_matching_criteria(particles, reconstructed, spacepoint_matching, frac_reco_matched, frac_truth_matched, **kwargs)
 
     return particles[["particle_id", "is_fiducial", "is_trackable", "is_matched", "is_double_matched"]], reconstructed
 
@@ -111,7 +111,8 @@ def get_particle_lengths(truth, particles, min_hits_truth=3):
 
     # get number of spacepoints in each particle
     truth = truth.merge(particles, on='particle_id', how='left')
-    particle_lengths = truth.particle_id.value_counts(sort=False).reset_index().rename(
+    module_ID = ["barrel_endcap", "hardware", "layer_disk", "eta_module", "phi_module"]
+    particle_lengths = truth.drop_duplicates(["particle_id"] + module_ID).particle_id.value_counts(sort=False).reset_index().rename(
         columns={"index":"particle_id", "particle_id": "n_true_hits"})
     
     # only particles leaves at least min_hits_truth spacepoints 
@@ -137,44 +138,46 @@ def get_shared_hits(truth, reconstructed, candidate_lengths, particle_lengths):
     # which means the majority of the spacepoints associated with the reconstructed
     # track candidate comes from that true track.
     # However, the other way may not be true.
-    reco_matching = reconstructed.groupby(['track_id', 'particle_id']).size()\
-        .reset_index().rename(columns={0:"n_common_hits"})
-
-    
-    # Each particle will be assigned to multiple reconstructed tracks
-    truth_matching = reconstructed.groupby(['particle_id', 'track_id']).size()\
+    spacepoint_matching = reconstructed.groupby(['track_id', 'particle_id']).size()\
         .reset_index().rename(columns={0:"n_shared"})
 
     # add number of hits to each of the maching dataframe
-    reco_matching = reco_matching.merge(candidate_lengths, on=['track_id'], how='left')
-    truth_matching = truth_matching.merge(particle_lengths, on=['particle_id'], how='left')
+    spacepoint_matching = spacepoint_matching.merge(candidate_lengths, on=['track_id'], how='left')
+    spacepoint_matching = spacepoint_matching.merge(particle_lengths, on=['particle_id'], how='left')
     
-    return reconstructed, reco_matching, truth_matching
+    return reconstructed, spacepoint_matching
 
-def get_matching_fractions(reco_matching, truth_matching):
+def get_matching_fractions(spacepoint_matching):
 
     # calculate matching fraction
-    reco_matching = reco_matching.assign(
-        purity_reco=np.true_divide(reco_matching.n_common_hits, reco_matching.n_reco_hits))
-    truth_matching = truth_matching.assign(
-        purity_true = np.true_divide(truth_matching.n_shared, truth_matching.n_true_hits))
+    spacepoint_matching = spacepoint_matching.assign(
+        purity_reco=np.true_divide(spacepoint_matching.n_shared, spacepoint_matching.n_reco_hits))
+    spacepoint_matching = spacepoint_matching.assign(
+        eff_true = np.true_divide(spacepoint_matching.n_shared, spacepoint_matching.n_true_hits))
+
+    # print(spacepoint_matching)
 
     # select the best match
-    reco_matching['purity_reco_max'] = reco_matching.groupby(
+    spacepoint_matching['purity_reco_max'] = spacepoint_matching.groupby(
         "track_id")['purity_reco'].transform(max)
-    truth_matching['purity_true_max'] = truth_matching.groupby(
-        "track_id")['purity_true'].transform(max)
+    spacepoint_matching['eff_true_max'] = spacepoint_matching.groupby(
+        "track_id")['eff_true'].transform(max)
 
-    return reco_matching, truth_matching
+    return spacepoint_matching
 
-def apply_matching_criteria(particles, reconstructed, reco_matching, truth_matching, frac_reco_matched=0.5, frac_truth_matched=0.5):
+def apply_matching_criteria(particles, reconstructed, spacepoint_matching, frac_reco_matched=0.5, frac_truth_matched=0.5, build_method="CC"):
 
-    matched_reco_tracks = reco_matching[
-        (reco_matching.purity_reco_max > frac_reco_matched)
+    matched_reco_tracks = spacepoint_matching[
+        (spacepoint_matching.purity_reco > frac_reco_matched)
     ]
-    matched_true_particles = truth_matching[
-        (truth_matching.purity_true_max > frac_truth_matched) \
-        & (truth_matching.purity_true == truth_matching.purity_true_max)]
+
+    if build_method == "CC":
+        matched_true_particles = spacepoint_matching[
+            (spacepoint_matching.eff_true_max > frac_truth_matched) \
+            & (spacepoint_matching.eff_true == spacepoint_matching.eff_true_max)]
+    elif build_method == "AP":
+        matched_true_particles = spacepoint_matching[
+            (spacepoint_matching.eff_true > frac_truth_matched)]
 
     # Without double matching, we use one-directional criteria
     combined_match = matched_true_particles.merge(

@@ -12,6 +12,9 @@ import torch.nn.functional as F
 from scipy import sparse as sps
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
+import networkx as nx
+
+from functools import partial
 
 from .tracking_utils import *
 from .plotting_utils import *
@@ -21,6 +24,15 @@ def load_single_pytorch_file(file):
         Loads a single Pytorch Geometric file
         """
         return torch.load(file, map_location="cpu")
+
+def build_single_candidates(instance, building_method, sanity_check, **kwargs):
+    instance.build_candidates(building_method, sanity_check, **kwargs)
+    return instance
+
+def evaluate_single_candidates(instance, evaluation_method, **kwargs):
+    instance.evaluate_candidates(**kwargs)
+    return instance
+
 
 class TrackingData():
     """
@@ -75,7 +87,7 @@ class TrackingData():
         Determine type of file
         """
         try:
-            sample = torch.load(self.files[0])
+            sample = torch.load(self.files[0], map_location="cpu")
             if str(type(sample)) == "<class 'torch_geometric.data.data.Data'>":
                 return "pytorch_geometric"
             else:
@@ -101,17 +113,26 @@ class TrackingData():
         """
         logging.info(f"Building candidates with sanity check: {sanity_check}")   
         
-        for event in tqdm(self.events):
-            event.build_candidates(building_method, sanity_check, **kwargs)
+        build_single_candidates_partial = partial(build_single_candidates, building_method=building_method, sanity_check=sanity_check, **kwargs)
+        self.events = process_map(build_single_candidates_partial, self.events, max_workers=8)
+
+        # for event in tqdm(self.events):
+        #     event.build_candidates(building_method, sanity_check, **kwargs)
 
     def evaluate_candidates(self, evaluation_method="matching", **kwargs):
         """
         Evaluates track candidates from events
         """
         logging.info("Evaluating candidates")
-        for event in tqdm(self.events):
-            event.evaluate_candidates(evaluation_method, **kwargs)
-                
+
+        evaluate_single_candidates_partial = partial(evaluate_single_candidates, evaluation_method=evaluation_method, **kwargs)
+        self.events = process_map(evaluate_single_candidates_partial, self.events, max_workers=8)
+
+        # for event in tqdm(self.events):
+        #     event.evaluate_candidates(evaluation_method, **kwargs)
+
+
+        # TODO: Tidy this up! 
         n_true_tracks, n_reco_tracks, n_matched_particles, n_matched_tracks, n_duplicated_tracks, n_single_matched_particles = 0, 0, 0, 0, 0, 0
         for event in self.events:
             n_true_tracks += event.candidates.evaluation["n_true_tracks"]
@@ -317,45 +338,35 @@ class Graph():
         r, phi, z = self.hits["x"].T
         R = np.sqrt(r**2 + z**2)
 
-        edges = self.edges
-        incoming_mask = R[edges["edge_index"]][0] > R[edges["edge_index"]][1]
-        edges["edge_index"][0][incoming_mask], edges["edge_index"][1][incoming_mask] = edges["edge_index"][1][incoming_mask], edges["edge_index"][0][incoming_mask]
-
-        row, col = self.edges["edge_index"][:, edge_mask]
-        starting_nodes = row[~torch.isin(row, col)].unique()
-        ending_nodes = col[~torch.isin(col, row)].unique()
-
-        edge_attr = np.ones(row.size(0))
-
-        N = self.hits["x"].size(0)
-        sparse_edges = sps.coo_matrix((edge_attr, (row.numpy(), col.numpy())), (N, N))
-
-        _, predecessors = sps.csgraph.shortest_path(sparse_edges, directed=True, indices=starting_nodes, return_predecessors=True)
-        predecessors = torch.from_numpy(predecessors)
-        stacked_edges = torch.stack(torch.where(predecessors >= 0))
-        stacked_edges = stacked_edges[:, torch.isin(stacked_edges[1], ending_nodes)]
-        stacked_edges =  stacked_edges[:, stacked_edges[0] != stacked_edges[1]]
-        running_stack = torch.stack([starting_nodes[stacked_edges[0]], stacked_edges[1]])
-
-        candidates = []
-        while running_stack.shape[1] > 0:
-            new_row = predecessors[stacked_edges[0], running_stack[-1]]
-            running_stack = torch.concat([running_stack, new_row.unsqueeze(0)], dim=0)
-            candidates.append(running_stack[:, running_stack[-1] < 0][:-1])
-            stacked_edges = stacked_edges[:, running_stack[-1] >= 0]
-            running_stack = running_stack[:, running_stack[-1] >= 0]
-
-        increment = 0
-        track_list = []
-        for candidate in candidates:
-
-            track_list.append(torch.stack([torch.arange(increment, increment+candidate.shape[1]).repeat(candidate.shape[0]), candidate.flatten()]))
-
-            increment += candidate.shape[1]
-
-        track_list = torch.concat(track_list, dim=-1)
+        # in_edges are the nodes towards the inner of the detector, out_edges are the nodes towards the outer
+        in_edges, out_edges = self.edges["edge_index"][:, edge_mask]
         
-        candidates = Candidates(track_list[1], track_list[0], building_method="AP")
+        # Ensure edges are numpy arrays
+        if (type(in_edges) != np.ndarray) or (type(out_edges) != np.ndarray):
+            in_edges = in_edges.numpy()
+            out_edges = out_edges.numpy()
+
+        # Sort edges by increasing R
+        wrong_direction_mask = R[in_edges] > R[out_edges]
+        in_edges[wrong_direction_mask], out_edges[wrong_direction_mask] = out_edges[wrong_direction_mask], in_edges[wrong_direction_mask]
+
+        starting_nodes = np.unique(in_edges[~np.isin(in_edges, out_edges)])
+        ending_nodes = np.unique(out_edges[~np.isin(out_edges, in_edges)])
+
+        # Build graph
+        G = nx.DiGraph()
+        G.add_edges_from(np.stack([in_edges, out_edges]).T)
+        all_paths = nx.shortest_path(G)
+        all_paths = {path: all_paths[path] for path in all_paths.keys() if path in starting_nodes}
+        valid_paths = [all_paths[start_key][end_key] 
+        for start_key in all_paths.keys() 
+        for end_key in all_paths[start_key].keys() 
+        if (start_key != end_key and end_key in ending_nodes)]
+
+        hit_list = np.array(list(itertools.chain.from_iterable(valid_paths)))
+        track_label_list = np.repeat(np.arange(len(valid_paths)), [len(path) for path in valid_paths])
+
+        candidates = Candidates(hit_list, track_label_list, building_method="AP")
 
         # TODO: CHECK THAT HIT ID IS USED CORRECTLY!!
 
@@ -459,7 +470,7 @@ class Candidates():
         Evaluates track candidates from event with matching criteria. Criteria given by ratios of common hits in candidates ("reconstructed") and particles ("truth")        
         """
 
-        particles, candidates = match_reco_tracks(self.get_df(), hit_truth, particles, **kwargs)
+        particles, candidates = match_reco_tracks(self.get_df(), hit_truth, particles, build_method = self.building_method, **kwargs)
         (n_true_tracks, n_reco_tracks, 
         n_matched_particles, n_single_matched_particles, n_matched_tracks, 
         n_duplicated_tracks, n_matched_tracks_poi) = get_statistics(particles, candidates)
