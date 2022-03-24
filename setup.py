@@ -14,6 +14,7 @@ dependencies = [
     "pyyaml>=5.1",
     "torch",
     "pytorch-lightning",
+    "tqdm"
 ]
 
 setup(

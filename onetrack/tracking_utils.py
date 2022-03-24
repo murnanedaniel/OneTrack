@@ -1,6 +1,5 @@
 # import all
 import os
-from sre_constants import NOT_LITERAL_UNI_IGNORE
 import sys
 import numpy as np
 import pandas as pd

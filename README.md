@@ -6,6 +6,12 @@ A simple library for evaluation of particle track reconstruction.
 
 This library is in a very early stage of development. It is only for testing with a narrow set of Pytorch Geometric data types. It is not recommended for production use.
 
+## Install
+```
+conda create --name onetrack python=3.9
+pip install onetrack
+```
+
 ## Example Usage
 
 ```
