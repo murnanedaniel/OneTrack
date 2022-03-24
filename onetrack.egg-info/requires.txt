@@ -1,7 +1,0 @@
-numpy
-scipy
-pandas
-matplotlib
-sklearn
-pyyaml>=5.1
-pytorch-lightning
